@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fairseq import utils
+from fairseq import checkpoint_utils
 from fairseq.models import (
     BaseFairseqModel,
     FairseqEncoder,
@@ -99,11 +101,19 @@ class MaskedLMModel(BaseFairseqModel):
                             help='Use gelu activation function in encoder'
                             ' layer')
 
+        # location to pretrained sentence encoder model
+        parser.add_argument('--pretrained-sentence-encoder', metavar='DIR',
+                            help='Path to the checkpoint for loading pretrained'
+                            ' sentence encoder')
+
     def forward(self, src_tokens, segment_labels, **kwargs):
         return self.encoder(src_tokens, segment_labels, **kwargs)
 
     def max_positions(self):
         return self.encoder.max_positions
+
+    def get_normalized_probs(self, net_output, log_probs):
+        return self.encoder.get_normalized_probs(net_output, log_probs)
 
     @classmethod
     def build_model(cls, args, task):
@@ -117,7 +127,15 @@ class MaskedLMModel(BaseFairseqModel):
 
         print("Model args: ", args)
 
-        encoder = MaskedLMEncoder(args, task.dictionary)
+        pretrained_sentence_encoder = None
+        if args.pretrained_sentence_encoder != '':
+            pretrained_model = checkpoint_utils.load_model_ensemble(
+                filenames=[args.pretrained_sentence_encoder],
+                task=task,
+            )[0][0]
+            pretrained_sentence_encoder = pretrained_model.encoder.sentence_encoder
+
+        encoder = MaskedLMEncoder(args, task.dictionary, pretrained_sentence_encoder)
         return cls(args, encoder)
 
 
@@ -126,7 +144,7 @@ class MaskedLMEncoder(FairseqEncoder):
     Encoder for Masked Language Modelling.
     """
 
-    def __init__(self, args, dictionary):
+    def __init__(self, args, dictionary, pretrained_sentence_encoder=None):
         super().__init__(dictionary)
 
         self.padding_idx = dictionary.pad()
@@ -152,6 +170,9 @@ class MaskedLMEncoder(FairseqEncoder):
             apply_bert_init=args.apply_bert_init,
             learned_pos_embedding=args.encoder_learned_pos,
         )
+
+        if pretrained_sentence_encoder is not None:
+            self.sentence_encoder.load_state_dict(pretrained_sentence_encoder.state_dict())
 
         self.share_input_output_embed = args.share_encoder_input_output_embed
         self.embed_out = None
@@ -223,6 +244,13 @@ class MaskedLMEncoder(FairseqEncoder):
         """Maximum output length supported by the encoder."""
         return self.max_positions
 
+    def get_normalized_probs(self, net_output, log_probs):
+        logits = net_output[1]['sentence_logits']
+        if log_probs:
+            return utils.log_softmax(logits, dim=-1)
+        else:
+            return utils.softmax(logits, dim=-1)
+
     def upgrade_state_dict_named(self, state_dict, name):
         if isinstance(
                 self.sentence_encoder.embed_positions,
@@ -263,6 +291,9 @@ def base_architecture(args):
 
     args.encoder_normalize_before = getattr(
         args, 'encoder_normalize_before', False)
+
+    args.pretrained_sentence_encoder = getattr(
+        args, 'pretrained_sentence_encoder', '')
     args.gelu = getattr(args, 'gelu', False)
 
 
